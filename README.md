@@ -152,7 +152,7 @@ python -m PyInstaller WDconnect.spec
 
 ## 開発環境
 
-このプロジェクトは [Cursor](https://cursor.sh/) で開発されました。
+このプロジェクトは [Cursor](https://cursor.sh/) で開発。
 
 ## ライセンス
 
