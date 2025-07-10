@@ -1,4 +1,4 @@
-# Android ワイヤレスデバッグツール
+# WDconnect
 
 Androidデバイスへのワイヤレスデバッグを簡単に設定・管理できるGUIツールです。
 
@@ -29,9 +29,9 @@ WDconnect/
 ├── config.py                  # 設定管理
 ├── wireless_debug_tool_compact.py  # 元の単一ファイル版（参考用）
 ├── requirements.txt           # 依存関係
-├── Android_Wireless_Debug_Tool.spec  # PyInstaller設定
+├── WDconnect.spec  # PyInstaller設定
 ├── dist/
-│   └── Android_Wireless_Debug_Tool.exe  # 実行可能ファイル
+│   └── WDconnect.exe  # 実行可能ファイル
 └── README.md                  # このファイル
 ```
 
@@ -51,7 +51,7 @@ python main.py
 
 ### 方法2: 実行可能ファイルとして実行
 
-最新の実行可能ファイルは `dist/Android_Wireless_Debug_Tool.exe` にあります。
+最新の実行可能ファイルは `dist/WDconnect.exe` にあります。
 
 ## 使用方法
 
@@ -106,10 +106,10 @@ python main.py
 pip install pyinstaller
 
 # 実行可能ファイルを作成
-python -m PyInstaller Android_Wireless_Debug_Tool.spec
+python -m PyInstaller WDconnect.spec
 ```
 
-ビルドが完了すると、`dist/Android_Wireless_Debug_Tool.exe` が作成されます。
+ビルドが完了すると、`dist/WDconnect.exe` が作成されます。
 
 ## 設定ファイル
 
