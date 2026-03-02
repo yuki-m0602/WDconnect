@@ -14,11 +14,9 @@ class LightWDconnectApp:
     def __init__(self, root):
         self.root = root
         self.root.title("WDconnect Light - Android Wireless Debug Tool")
-        self.lock_window_size = True
-        self.root.geometry("720x320")
-        self.root.minsize(720, 320)
-        self.root.maxsize(720, 320)
-        self.root.resizable(False, False)
+        self.root.geometry("720x400")
+        self.root.minsize(600, 350)
+        self.root.resizable(True, True)
         
         # ADB設定
         self.adb_path = None
@@ -1110,8 +1108,8 @@ class LightWDconnectApp:
                 if 'wireless_port' in config:
                     self.port_var.set(config['wireless_port'])
                     
-                # ウィンドウサイズを設定（固定モードでは適用しない）
-                if 'window_size' in config and not getattr(self, 'lock_window_size', True):
+                # ウィンドウサイズを設定
+                if 'window_size' in config:
                     self.root.geometry(config['window_size'])
                     
                 # ログキャットウィンドウサイズを設定
@@ -1154,9 +1152,8 @@ class LightWDconnectApp:
             if self.port_var.get().strip():
                 config['wireless_port'] = self.port_var.get().strip()
                 
-            # ウィンドウサイズを保存（固定モードでは保存しない）
-            if not getattr(self, 'lock_window_size', True):
-                config['window_size'] = self.root.geometry()
+            # ウィンドウサイズを保存
+            config['window_size'] = self.root.geometry()
             
             # ログキャットウィンドウサイズを保存
             if hasattr(self, 'logcat_window_size'):
