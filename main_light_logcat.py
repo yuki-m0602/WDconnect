@@ -50,6 +50,10 @@ class LightWDconnectApp:
         self.last_connected_device = None
         self.connection_check_interval = 5  # 5秒間隔でチェック
         
+        # 接続履歴（成功した接続を記憶）
+        self.connection_history = []
+        self.max_history_size = 10
+        
         self.setup_ui()
         self.load_settings()
         
@@ -114,7 +118,8 @@ class LightWDconnectApp:
         ttk.Button(usb_buttons_frame, text="USB接続確認", command=self.check_usb_connection).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(usb_buttons_frame, text="ワイヤレスデバッグ有効化＆接続", command=self.enable_wireless_debug).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(usb_buttons_frame, text="ポートスキャン", command=self.scan_port_manual).pack(side=tk.LEFT, padx=(0, 5))
-        ttk.Button(usb_buttons_frame, text="手動ワイヤレス接続", command=self.connect_wireless).pack(side=tk.LEFT)
+        ttk.Button(usb_buttons_frame, text="手動ワイヤレス接続", command=self.connect_wireless).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(usb_buttons_frame, text="🩺診断＆修復", command=self.diagnose_and_fix).pack(side=tk.LEFT)
         
         # ワイヤレス設定
         wireless_frame = ttk.Frame(usb_frame)
@@ -798,6 +803,8 @@ class LightWDconnectApp:
             self.wireless_status_label.config(text=f"ワイヤレス接続済み: {ip}:{port}", foreground="green")
             self.refresh_devices()
             print(f"ワイヤレス接続成功: {ip}:{port}")
+            # 接続履歴を保存
+            self.save_successful_connection(ip, port)
             # 接続監視を開始
             self.start_connection_monitor()
         else:
@@ -844,11 +851,117 @@ class LightWDconnectApp:
             self.wireless_status_label.config(text=f"ワイヤレス接続済み: {ip}:{port}", foreground="green")
             self.refresh_devices()
             print(f"ワイヤレス接続成功: {ip}:{port}")
+            # 接続履歴を保存
+            self.save_successful_connection(ip, port)
             # 接続監視を開始
             self.start_connection_monitor()
         else:
             print(f"ワイヤレス接続失敗: {result.stdout}")
             self.diagnose_connection(ip, port)
+
+    def diagnose_and_fix(self):
+        """自動診断と修復（ワンクリック）"""
+        print("\n" + "="*50)
+        print("🔧 自動診断と修復を開始します")
+        print("="*50 + "\n")
+        
+        issues_found = []
+        fixes_applied = []
+        
+        # Step 1: ADBパス確認
+        print("Step 1/6: ADBパスを確認中...")
+        if not self.adb_path:
+            print("  ⚠ ADBパスが設定されていません")
+            issues_found.append("ADBパス未設定")
+            print("  🔧 自動検出を試行します...")
+            self.detect_adb()
+            if self.adb_path:
+                fixes_applied.append("ADBパス自動検出")
+                print("  ✅ ADBパスを自動検出しました")
+            else:
+                print("  ❌ ADBの自動検出に失敗しました。手動で設定してください。")
+                return False
+        else:
+            print("  ✅ ADBパスは設定済みです")
+        
+        # Step 2: ADBサーバー状態確認
+        print("\nStep 2/6: ADBサーバー状態を確認中...")
+        result = self.run_adb_command(["version"], timeout=5, retry_on_timeout=False)
+        if result is None or result.returncode != 0:
+            print("  ⚠ ADBサーバーが応答しません")
+            issues_found.append("ADBサーバー停止")
+            print("  🔧 ADBサーバーをリセットします...")
+            if self.reset_adb_server():
+                fixes_applied.append("ADBサーバーリセット")
+                print("  ✅ ADBサーバーをリセットしました")
+            else:
+                print("  ❌ ADBサーバーのリセットに失敗しました")
+                return False
+        else:
+            print("  ✅ ADBサーバーは正常に動作しています")
+        
+        # Step 3: デバイス検出
+        print("\nStep 3/6: デバイスを検出中...")
+        self.refresh_devices()
+        if self.devices:
+            print(f"  ✅ {len(self.devices)}台のデバイスが検出されました")
+        else:
+            print("  ⚠ デバイスが検出されません")
+            issues_found.append("デバイス未検出")
+        
+        # Step 4: USB接続確認
+        print("\nStep 4/6: USB接続を確認中...")
+        result = self.run_adb_command(["devices"], timeout=5)
+        if result and result.returncode == 0:
+            lines = result.stdout.strip().split('\n')[1:]
+            usb_devices = [l for l in lines if l.strip() and not ':' in l.split('\t')[0] if '\t' in l]
+            if usb_devices:
+                print("  ✅ USBデバイスが接続されています")
+                # IPアドレス取得
+                self.get_device_ip()
+            else:
+                print("  ⚠ USBデバイスが見つかりません")
+        
+        # Step 5: 履歴からの再接続試行
+        print("\nStep 5/6: 過去の接続履歴から再接続を試行中...")
+        if self.try_quick_reconnect():
+            fixes_applied.append("履歴から高速再接続")
+            print("  ✅ 過去の接続から自動再接続しました")
+            print("\n" + "="*50)
+            print("🎉 すべての問題が解決されました！")
+            print("="*50 + "\n")
+            return True
+        else:
+            print("  ℹ 有効な接続履歴が見つかりません")
+        
+        # Step 6: ワイヤレス接続準備
+        print("\nStep 6/6: ワイヤレス接続の準備...")
+        ip = self.ip_var.get().strip()
+        if ip and self.selected_device and not ':' in self.selected_device:
+            print(f"  ℹ IPアドレスが設定されています: {ip}")
+            print("  💡 「ワイヤレスデバッグ有効化＆接続」ボタンで接続できます")
+        else:
+            print("  ℹ ワイヤレス接続の準備ができていません")
+            print("  💡 USBでデバイスを接続してから「ワイヤレスデバッグ有効化」を実行してください")
+        
+        # 結果サマリー
+        print("\n" + "="*50)
+        if issues_found:
+            print(f"📋 検出された問題: {len(issues_found)}件")
+            for issue in issues_found:
+                print(f"   - {issue}")
+        if fixes_applied:
+            print(f"\n🔧 適用された修正: {len(fixes_applied)}件")
+            for fix in fixes_applied:
+                print(f"   - {fix}")
+        
+        if not issues_found or len(fixes_applied) == len(issues_found):
+            print("\n🎉 すべての問題が解決されました！")
+        else:
+            print("\n⚠ 一部の問題が残っています。上記の手順を確認してください。")
+        print("="*50 + "\n")
+        
+        return len(fixes_applied) > 0
 
     def copy_adb_connect_command(self):
         """adb connect <IP>:<PORT> をクリップボードにコピー"""
@@ -1057,6 +1170,10 @@ class LightWDconnectApp:
             else:
                 config['logcat_theme'] = "light"
                 
+            # 接続履歴を保存
+            if hasattr(self, 'connection_history') and self.connection_history:
+                config['connection_history'] = self.connection_history[-5:]  # 最新5件のみ
+            
             # 保存日時を記録
             from datetime import datetime
             config['last_saved'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1068,6 +1185,63 @@ class LightWDconnectApp:
                 
         except Exception as e:
             print(f"設定保存エラー: {e}")
+
+    def save_successful_connection(self, ip, port):
+        """成功した接続を履歴に保存"""
+        connection_info = {
+            'ip': ip,
+            'port': port,
+            'timestamp': time.time()
+        }
+        
+        # 既存の同じ接続情報を削除
+        self.connection_history = [
+            c for c in self.connection_history 
+            if not (c['ip'] == ip and c['port'] == port)
+        ]
+        
+        # 新しい接続を追加
+        self.connection_history.append(connection_info)
+        
+        # 最大サイズを超えたら古いものを削除
+        if len(self.connection_history) > self.max_history_size:
+            self.connection_history.pop(0)
+        
+        print(f"接続履歴を保存: {ip}:{port}")
+        self.save_settings()
+
+    def get_last_successful_connection(self):
+        """最後に成功した接続情報を取得"""
+        if self.connection_history:
+            return self.connection_history[-1]
+        return None
+
+    def try_quick_reconnect(self):
+        """履歴から高速再接続を試行"""
+        last_conn = self.get_last_successful_connection()
+        if not last_conn:
+            return False
+        
+        ip, port = last_conn['ip'], last_conn['port']
+        
+        # ポートが開いているか確認
+        import socket
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(2)
+            result = sock.connect_ex((ip, int(port)))
+            sock.close()
+            
+            if result == 0:
+                print(f"履歴から高速再接続: {ip}:{port}")
+                self.ip_var.set(ip)
+                self.port_var.set(port)
+                self.connect_wireless()
+                return True
+        except:
+            pass
+        
+        return False
 
 def main():
     root = tk.Tk()
