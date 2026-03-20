@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.Python
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+ENV/
+
+# ユーザー環境で生成
+wireless_debug_config.json
