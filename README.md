@@ -3,9 +3,14 @@
 Android ワイヤレスデバッグ＋軽量 Logcat の Tkinter アプリです。  
 このフォルダはリポジトリ内にまとめた **単体移動用** です。親ディレクトリ（例: `AndroidStudioProjects`）へフォルダごと移動して、そこで `git init` する想定です。
 
-## 起動
+## ダウンロード
 
+### Windows用EXE
+**[WDconnect_Light_Logcat.exe](https://github.com/yuki-m0602/WDConnect_1/releases/latest/download/WDconnect_Light_Logcat.exe)** をダウンロードしてダブルクリックで起動
+
+### ソースから起動
 ```bash
+pip install -r requirements.txt
 python run_light_logcat.py
 ```
 
@@ -20,7 +25,7 @@ build_light_logcat.bat
 
 成果物: `dist\WDconnect_Light_Logcat.exe`
 
-## 同梱ファイル
+## 同封ファイル
 
 | ファイル | 説明 |
 |----------|------|
