@@ -1,4 +1,6 @@
 __pycache__/
+.kilocode/
+
 *.py[cod]
 .Python
 build/
