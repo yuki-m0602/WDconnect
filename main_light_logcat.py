@@ -1,7 +1,9 @@
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog, scrolledtext
+from tkinter import ttk, messagebox, filedialog, scrolledtext, simpledialog
 import subprocess
 import threading
+import concurrent.futures
+import socket as py_socket
 import os
 import sys
 import re
@@ -10,6 +12,16 @@ import time
 from typing import Optional
 from datetime import datetime
 from logcat_widget_light import LightLogcatWidget
+
+ADB_DEVICE_TXT = "adb_device.txt"
+
+
+def _subprocess_hide_console_kwargs():
+    """Windows で adb 等を叩くたびに CMD が一瞬表示されるのを防ぐ"""
+    if sys.platform == "win32":
+        return {"creationflags": subprocess.CREATE_NO_WINDOW}
+    return {}
+
 
 class StdoutRedirector:
     """標準出力をGUIのテキストウィジェットにリダイレクト"""
@@ -45,8 +57,8 @@ class LightWDconnectApp:
     def __init__(self, root):
         self.root = root
         self.root.title("WDconnect Light - Android Wireless Debug Tool")
-        self.root.geometry("720x400")
-        self.root.minsize(600, 350)
+        self.root.geometry("720x480")
+        self.root.minsize(620, 400)
         self.root.resizable(True, True)
         
         # ADB設定
@@ -62,6 +74,12 @@ class LightWDconnectApp:
         # ワイヤレスデバッグ設定
         self.wireless_ip = None
         self.wireless_port = "5555"
+        self.ip_var = tk.StringVar()
+        self.port_var = tk.StringVar(value="5555")
+        self.pairing_port_var = tk.StringVar()
+        self.pairing_code_var = tk.StringVar()
+        self.simple_connect_hint_var = tk.StringVar(value="")
+        self.saved_mdns_endpoint_var = tk.StringVar(value="")
         
         # ウィジェット
         self.logcat_widget = None
@@ -83,8 +101,14 @@ class LightWDconnectApp:
         self.connection_history = []
         self.max_history_size = 10
         
+        # 接続状況の自動更新（メインスレッドで adb devices を定期実行）
+        self.status_poll_interval_ms = 3000
+        self._status_poll_job = None
+        self._closing = False
+        
         self.setup_ui()
         self.load_settings()
+        self._sync_saved_endpoint_from_file()
         
         # 設定が読み込まれていない場合のみ自動検出
         if not self.adb_path:
@@ -95,21 +119,49 @@ class LightWDconnectApp:
         # 初期設定を保存
         self.save_settings()
         
+        self._schedule_status_poll()
+        if self.adb_path:
+            self.refresh_devices(preserve_selection=True)
+
+    def auto_connect_on_startup(self):
+        """起動時に自動接続を試行（1クリック操作を実現）"""
+        if not self.adb_path:
+            return
+
+        print("自動接続を開始します...")
+
+        # USBデバイスからIPを取得
+        self._try_autofill_ip_from_usb()
+
+        # 保存された接続先を試行
+        if self._try_saved_mdns_connect_with_refresh():
+            print("✅ 保存された接続先で接続成功")
+            return
+
+        # mDNSや他の候補を試行
+        candidates = self._wireless_connect_candidates(include_mdns=True)
+        if candidates:
+            for ip, port in candidates:
+                print(f"接続試行: {self._format_endpoint_label(ip, port)}")
+                result = self.run_adb_command(["connect", f"{ip}:{port}"], timeout=10)
+                if result and result.returncode == 0 and "connected" in result.stdout.lower():
+                    self._finalize_wireless_connected(ip, port)
+                    print(f"✅ 自動接続成功: {ip}:{port}")
+                    return
+
+        print("自動接続: 利用可能な接続先が見つかりませんでした")
+        
     def setup_ui(self):
-        """軽量なUIを設定"""
-        # メインフレーム
+        """軽量なUIを設定（簡単／詳細タブ）"""
         main_frame = ttk.Frame(self.root)
         main_frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
         
-        # タイトル
         title_label = ttk.Label(main_frame, text="WDconnect Light", font=("Arial", 13, "bold"))
-        title_label.pack(pady=(0, 10))
+        title_label.pack(pady=(0, 8))
         
-        # ADB設定フレーム
         adb_frame = ttk.LabelFrame(main_frame, text="ADB設定", padding="5")
-        adb_frame.pack(fill=tk.X, pady=(0, 10))
+        adb_frame.pack(fill=tk.X, pady=(0, 6))
         
-        # ADBパス設定
         adb_path_frame = ttk.Frame(adb_frame)
         adb_path_frame.pack(fill=tk.X, pady=(0, 4))
         
@@ -121,7 +173,6 @@ class LightWDconnectApp:
         ttk.Button(adb_path_frame, text="参照", command=self.browse_adb).pack(side=tk.LEFT)
         ttk.Button(adb_path_frame, text="検出", command=self.detect_adb).pack(side=tk.LEFT, padx=(5, 0))
         
-        # デバイス選択
         device_frame = ttk.Frame(adb_frame)
         device_frame.pack(fill=tk.X, pady=(4, 0))
         
@@ -132,15 +183,112 @@ class LightWDconnectApp:
         
         ttk.Button(device_frame, text="更新", command=self.refresh_devices).pack(side=tk.LEFT)
         
-        # 接続状態
         self.status_label = ttk.Label(adb_frame, text="未接続", foreground="red")
         self.status_label.pack(pady=(5, 0))
         
-        # USB接続管理フレーム
-        usb_frame = ttk.LabelFrame(main_frame, text="USB接続管理", padding="5")
+        self.wireless_status_label = ttk.Label(main_frame, text="ワイヤレス未接続", foreground="red")
+        self.wireless_status_label.pack(anchor=tk.W, pady=(0, 4))
+        
+        notebook = ttk.Notebook(main_frame)
+        notebook.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
+        
+        tab_simple = ttk.Frame(notebook, padding=6)
+        tab_advanced = ttk.Frame(notebook, padding=6)
+        notebook.add(tab_simple, text="簡単")
+        notebook.add(tab_advanced, text="詳細")
+        
+        self.logcat_window = None
+        self.logcat_widget = None
+        
+        self._setup_advanced_tab(tab_advanced)
+        self._setup_simple_tab(tab_simple)
+        
+        notebook.select(0)
+        
+        def _hint_on_ip_change(*_):
+            try:
+                if self.root.winfo_exists():
+                    self._refresh_simple_connect_hint()
+            except tk.TclError:
+                pass
+        
+        self.ip_var.trace_add('write', lambda *_: self.root.after_idle(_hint_on_ip_change))
+        self.port_var.trace_add('write', lambda *_: self.root.after_idle(_hint_on_ip_change))
+        
+        print("✅ WDconnect Light を起動しました（「簡単」タブ：2回目からは接続ボタンのみ）")
+        print("💡 詳細なログは「詳細」タブを開いてください")
+    
+    def _setup_simple_tab(self, parent):
+        """簡単UI: 接続とSCRCPYのみ"""
+        hint = ttk.Label(
+            parent,
+            text="スマホで「ワイヤレスデバッグ」をONにして、同じWi‑Fiに接続してから「接続」ボタンを押してください。",
+            justify=tk.LEFT,
+            wraplength=620,
+            font=("Arial", 9),
+        )
+        hint.pack(anchor=tk.W, pady=(0, 10))
+        
+        button_frame = ttk.Frame(parent)
+        button_frame.pack(pady=(0, 10))
+        
+        ttk.Button(
+            button_frame,
+            text="接続",
+            command=self.easy_wireless_connect,
+            width=20,
+        ).pack(side=tk.LEFT, padx=(0, 10))
+        
+        ttk.Button(
+            button_frame,
+            text="SCRCPY開始",
+            command=self.start_scrcpy,
+            width=15,
+        ).pack(side=tk.LEFT)
+        
+        log_frame = ttk.LabelFrame(parent, text="ログ", padding="5")
+        log_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        
+        self.simple_log_text = scrolledtext.ScrolledText(
+            log_frame,
+            height=12,
+            wrap=tk.WORD,
+            font=("Consolas", 9),
+        )
+        self.simple_log_text.pack(fill=tk.BOTH, expand=True)
+        
+        self.simple_log_text.tag_config("info", foreground="black")
+        self.simple_log_text.tag_config("success", foreground="green")
+        self.simple_log_text.tag_config("error", foreground="red")
+        
+        ttk.Button(
+            log_frame,
+            text="クリア",
+            command=self.clear_simple_log,
+        ).pack(pady=(5, 0))
+        
+        ttk.Label(
+            parent,
+            text="詳細設定は「詳細」タブへ",
+            foreground="gray",
+            font=("Arial", 8),
+        ).pack(pady=(5, 0))
+
+    def clear_simple_log(self):
+        """简单タブのログをクリア"""
+        self.simple_log_text.delete(1.0, tk.END)
+
+    def log_simple(self, message, tag="info"):
+        """简单タブにログを出力"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.simple_log_text.insert(tk.END, f"[{timestamp}] {message}\n", tag)
+        self.simple_log_text.see(tk.END)
+    
+    def _setup_advanced_tab(self, parent):
+        """従来のUSB・ワイヤレス・ログ一式"""
+        usb_frame = ttk.LabelFrame(parent, text="USB接続管理", padding="5")
         usb_frame.pack(fill=tk.X, pady=(0, 10))
         
-        # USB接続ボタン
         usb_buttons_frame = ttk.Frame(usb_frame)
         usb_buttons_frame.pack(fill=tk.X, pady=(0, 4))
         
@@ -150,30 +298,21 @@ class LightWDconnectApp:
         ttk.Button(usb_buttons_frame, text="手動ワイヤレス接続", command=self.connect_wireless).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(usb_buttons_frame, text="🩺診断＆修復", command=self.diagnose_and_fix).pack(side=tk.LEFT)
         
-        # ワイヤレス設定
         wireless_frame = ttk.Frame(usb_frame)
         wireless_frame.pack(fill=tk.X, pady=(4, 0))
         
         ttk.Label(wireless_frame, text="IPアドレス:").pack(side=tk.LEFT)
-        self.ip_var = tk.StringVar()
         self.ip_entry = ttk.Entry(wireless_frame, textvariable=self.ip_var, width=12)
         self.ip_entry.pack(side=tk.LEFT, padx=(5, 10))
         
         ttk.Label(wireless_frame, text="ポート:").pack(side=tk.LEFT)
-        self.port_var = tk.StringVar(value="5555")
         self.port_entry = ttk.Entry(wireless_frame, textvariable=self.port_var, width=6)
         self.port_entry.pack(side=tk.LEFT, padx=(5, 0))
         ttk.Button(wireless_frame, text="ADB+", width=5, command=self.copy_adb_connect_command).pack(side=tk.LEFT, padx=(6, 0))
         
-        # ワイヤレス状態
-        self.wireless_status_label = ttk.Label(usb_frame, text="ワイヤレス未接続", foreground="red")
-        self.wireless_status_label.pack(pady=(5, 0))
-        
-        # SCRCPY設定フレーム
-        scrcpy_frame = ttk.LabelFrame(main_frame, text="SCRCPY設定", padding="5")
+        scrcpy_frame = ttk.LabelFrame(parent, text="SCRCPY設定", padding="5")
         scrcpy_frame.pack(fill=tk.X, pady=(0, 10))
         
-        # SCRCPYパス設定
         scrcpy_path_frame = ttk.Frame(scrcpy_frame)
         scrcpy_path_frame.pack(fill=tk.X, pady=(0, 4))
         
@@ -185,7 +324,6 @@ class LightWDconnectApp:
         ttk.Button(scrcpy_path_frame, text="参照", command=self.browse_scrcpy).pack(side=tk.LEFT)
         ttk.Button(scrcpy_path_frame, text="検出", command=self.detect_scrcpy).pack(side=tk.LEFT, padx=(5, 0))
         
-        # SCRCPYコントロール
         scrcpy_control_frame = ttk.Frame(scrcpy_frame)
         scrcpy_control_frame.pack(fill=tk.X, pady=(4, 0))
         
@@ -195,49 +333,34 @@ class LightWDconnectApp:
         self.scrcpy_stop_button = ttk.Button(scrcpy_control_frame, text="SCRCPY停止", command=self.stop_scrcpy, state=tk.DISABLED)
         self.scrcpy_stop_button.pack(side=tk.LEFT)
         
-        # ログキャットボタン
-        logcat_frame = ttk.LabelFrame(main_frame, text="ログキャット", padding="5")
+        logcat_frame = ttk.LabelFrame(parent, text="ログキャット", padding="5")
         logcat_frame.pack(fill=tk.X, pady=(0, 6))
         
-        logcat_button = ttk.Button(logcat_frame, text="📱 ログキャットを開く", command=self.open_logcat_window)
-        logcat_button.pack(side=tk.LEFT, padx=(0, 10))
-        
+        ttk.Button(logcat_frame, text="📱 ログキャットを開く", command=self.open_logcat_window).pack(side=tk.LEFT, padx=(0, 10))
         ttk.Label(logcat_frame, text="ログキャットウィンドウを別ウィンドウで開きます").pack(side=tk.LEFT)
         
-        # ログキャットウィンドウの参照
-        self.logcat_window = None
-        self.logcat_widget = None
-        
-        # ログウィンドウ（GUI内）
-        log_frame = ttk.LabelFrame(main_frame, text="📋 ログ", padding="5")
+        log_frame = ttk.LabelFrame(parent, text="📋 ログ", padding="5")
         log_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
         
         self.log_text = scrolledtext.ScrolledText(
-            log_frame, 
-            height=10, 
+            log_frame,
+            height=10,
             wrap=tk.WORD,
-            font=("Consolas", 9)
+            font=("Consolas", 9),
         )
         self.log_text.pack(fill=tk.BOTH, expand=True)
         
-        # ログのタグ設定（色付け）
         self.log_text.tag_config("info", foreground="black")
         self.log_text.tag_config("success", foreground="green")
         self.log_text.tag_config("warning", foreground="orange")
         self.log_text.tag_config("error", foreground="red")
         
-        # 標準出力をリダイレクト
         self.stdout_redirector = StdoutRedirector(self.log_text)
         sys.stdout = self.stdout_redirector
         
-        # クリアボタン
         button_frame = ttk.Frame(log_frame)
         button_frame.pack(fill=tk.X, pady=(5, 0))
         ttk.Button(button_frame, text="🗑️ クリア", command=self.clear_log).pack(side=tk.RIGHT)
-        
-        # 初期ログメッセージ
-        print("✅ WDconnect Light を起動しました")
-        print("💡 デバイスを接続して「更新」ボタンをクリックしてください")
         
     def clear_log(self):
         """ログをクリア"""
@@ -269,7 +392,8 @@ class LightWDconnectApp:
                     text=True,
                     timeout=timeout,
                     encoding='utf-8',
-                    errors='replace'
+                    errors='replace',
+                    **_subprocess_hide_console_kwargs(),
                 )
                 return result
                 
@@ -296,13 +420,21 @@ class LightWDconnectApp:
         """
         try:
             print("ADBサーバーを停止中...")
-            subprocess.run([self.adb_path, "kill-server"], 
-                         capture_output=True, timeout=5)
+            subprocess.run(
+                [self.adb_path, "kill-server"],
+                capture_output=True,
+                timeout=5,
+                **_subprocess_hide_console_kwargs(),
+            )
             time.sleep(1)
             
             print("ADBサーバーを起動中...")
-            result = subprocess.run([self.adb_path, "start-server"], 
-                                  capture_output=True, timeout=10)
+            result = subprocess.run(
+                [self.adb_path, "start-server"],
+                capture_output=True,
+                timeout=10,
+                **_subprocess_hide_console_kwargs(),
+            )
             
             if result.returncode == 0:
                 print("ADBサーバーのリセットに成功しました")
@@ -410,7 +542,7 @@ class LightWDconnectApp:
         if not self.scrcpy_path:
             messagebox.showwarning("警告", "SCRCPYが見つかりませんでした。手動で選択してください。")
         
-    def refresh_devices(self):
+    def refresh_devices(self, preserve_selection=True):
         """デバイスリストを更新（安全なコマンド実行）"""
         result = self.run_adb_command(["devices"], timeout=5)
         
@@ -430,23 +562,56 @@ class LightWDconnectApp:
                         if status == 'device':
                             self.devices.append(device_id)
                             
-            # コンボボックスを更新
             self.device_combo['values'] = self.devices
+            prev = self.selected_device
             
             if self.devices:
-                self.device_combo.set(self.devices[0])
-                self.selected_device = self.devices[0]
+                if preserve_selection and prev and prev in self.devices:
+                    self.device_combo.set(prev)
+                    self.selected_device = prev
+                else:
+                    self.device_combo.set(self.devices[0])
+                    self.selected_device = self.devices[0]
                 self.status_label.config(text=f"接続済み: {len(self.devices)}台", foreground="green")
                 
-                # ログキャットウィジェットに設定（存在する場合のみ）
                 if self.logcat_widget:
                     self.logcat_widget.set_adb_path(self.adb_path)
                     self.logcat_widget.set_device_id(self.selected_device)
             else:
+                self.device_combo.set('')
+                self.selected_device = None
                 self.status_label.config(text="デバイスが見つかりません", foreground="orange")
+            
+            self._update_wireless_status_display()
         else:
             print(f"デバイス取得エラー: {result.stderr}")
             self.status_label.config(text="エラー", foreground="red")
+    
+    def _update_wireless_status_display(self):
+        """ADB 一覧に合わせてワイヤレス行のラベルを更新"""
+        if not self.adb_path:
+            return
+        sel = self.selected_device or ''
+        wireless_ok = [d for d in self.devices if ':' in d]
+        
+        if sel and ':' in sel:
+            if sel in self.devices:
+                ip, port = sel.rsplit(':', 1)
+                dn = self._lookup_history_device_name(ip, port)
+                if dn:
+                    self.wireless_status_label.config(
+                        text=f"ワイヤレス: {dn} ({sel})", foreground="green")
+                else:
+                    self.wireless_status_label.config(
+                        text=f"ワイヤレス接続済み: {sel}", foreground="green")
+            else:
+                self.wireless_status_label.config(text="ワイヤレス切断", foreground="red")
+        elif wireless_ok:
+            self.wireless_status_label.config(
+                text=f"ワイヤレス{len(wireless_ok)}台接続中（一覧で選択）",
+                foreground="orange")
+        else:
+            self.wireless_status_label.config(text="ワイヤレス未接続", foreground="red")
             
     def on_device_select(self, event=None):
         """デバイス選択時の処理"""
@@ -454,16 +619,27 @@ class LightWDconnectApp:
         if self.selected_device and self.logcat_widget:
             self.logcat_widget.set_device_id(self.selected_device)
             
+    def check_scrcpy_status(self):
+        """SCRCPYの実際の起動状態を確認"""
+        if not self.scrcpy_process:
+            return False
+        return self.scrcpy_process.poll() is None
+
     def start_scrcpy(self):
         """SCRCPYを開始"""
-        if not self.scrcpy_path or not self.selected_device or self.is_scrcpy_running:
+        if not self.scrcpy_path:
+            messagebox.showwarning("SCRCPY", "SCRCPYパスが設定されていません")
+            return
+        if not self.selected_device:
+            messagebox.showwarning("SCRCPY", "接続中のデバイスがありません")
+            return
+        if self.check_scrcpy_status():
+            messagebox.showinfo("SCRCPY", "すでに起動中です")
             return
             
         try:
-            # SCRCPYを開始
             cmd = [self.scrcpy_path, "-s", self.selected_device]
             
-            # Windowsでコマンドラインウィンドウを表示しないようにする
             import platform
             if platform.system() == "Windows":
                 self.scrcpy_process = subprocess.Popen(
@@ -472,30 +648,59 @@ class LightWDconnectApp:
                 )
             else:
                 self.scrcpy_process = subprocess.Popen(cmd)
-                
-            self.is_scrcpy_running = True
-            self.scrcpy_start_button.config(state=tk.DISABLED)
-            self.scrcpy_stop_button.config(state=tk.NORMAL)
+            
+            self.root.after(1000, self._update_scrcpy_button_state)
+            self.log_simple(f"SCRCPY起動: {self.selected_device}", "info")
             
         except Exception as e:
-            print(f"SCRCPYの開始に失敗しました: {e}")
-            
+            messagebox.showerror("SCRCPY", f"起動に失敗しました: {e}")
+            self.log_simple(f"SCRCPY起動失敗: {e}", "error")
+
+    def _update_scrcpy_button_state(self):
+        """ボタンの状態を更新（1秒後に実際のプロセス状態を確認）"""
+        if self.check_scrcpy_status():
+            self.is_scrcpy_running = True
+            self.log_simple("SCRCPY起動中", "success")
+            if hasattr(self, 'scrcpy_start_button'):
+                self.scrcpy_start_button.config(state=tk.DISABLED)
+            if hasattr(self, 'scrcpy_stop_button'):
+                self.scrcpy_stop_button.config(state=tk.NORMAL)
+        else:
+            self.is_scrcpy_running = False
+            if self.scrcpy_process:
+                returncode = self.scrcpy_process.returncode
+                if returncode != 0:
+                    self.log_simple(f"SCRCPY終了（コード: {returncode}）", "error")
+            if hasattr(self, 'scrcpy_start_button'):
+                self.scrcpy_start_button.config(state=tk.NORMAL)
+            if hasattr(self, 'scrcpy_stop_button'):
+                self.scrcpy_stop_button.config(state=tk.DISABLED)
+            self.scrcpy_process = None
+
     def stop_scrcpy(self):
         """SCRCPYを停止"""
-        if not self.is_scrcpy_running:
+        if not self.check_scrcpy_status():
+            self.is_scrcpy_running = False
+            if hasattr(self, 'scrcpy_start_button'):
+                self.scrcpy_start_button.config(state=tk.NORMAL)
+            if hasattr(self, 'scrcpy_stop_button'):
+                self.scrcpy_stop_button.config(state=tk.DISABLED)
+            self.scrcpy_process = None
             return
             
         try:
-            if self.scrcpy_process:
-                self.scrcpy_process.terminate()
-                self.scrcpy_process.wait(timeout=5)
-                self.scrcpy_process = None
-                
+            self.scrcpy_process.terminate()
+            self.scrcpy_process.wait(timeout=5)
+            self.scrcpy_process = None
             self.is_scrcpy_running = False
-            self.scrcpy_start_button.config(state=tk.NORMAL)
-            self.scrcpy_stop_button.config(state=tk.DISABLED)
+            if hasattr(self, 'scrcpy_start_button'):
+                self.scrcpy_start_button.config(state=tk.NORMAL)
+            if hasattr(self, 'scrcpy_stop_button'):
+                self.scrcpy_stop_button.config(state=tk.DISABLED)
+            print("SCRCPYを停止しました")
             
         except Exception as e:
+            messagebox.showerror("SCRCPY", f"停止に失敗しました: {e}")
             print(f"SCRCPYの停止に失敗しました: {e}")
             
     def run(self):
@@ -507,9 +712,40 @@ class LightWDconnectApp:
     def on_app_close(self):
         """アプリケーション終了時の処理"""
         print("アプリケーションを終了します...")
+        self._closing = True
+        self._cancel_status_poll()
         self.stop_connection_monitor()
         self.save_settings()
         self.root.destroy()
+
+    def _schedule_status_poll(self):
+        if getattr(self, '_closing', False):
+            return
+        self._status_poll_job = self.root.after(self.status_poll_interval_ms, self._on_status_poll)
+
+    def _cancel_status_poll(self):
+        if self._status_poll_job is not None:
+            try:
+                self.root.after_cancel(self._status_poll_job)
+            except tk.TclError:
+                pass
+            self._status_poll_job = None
+
+    def _on_status_poll(self):
+        self._status_poll_job = None
+        if getattr(self, '_closing', False):
+            return
+        try:
+            if self.adb_path:
+                self.refresh_devices(preserve_selection=True)
+        except tk.TclError:
+            return
+        if not getattr(self, '_closing', False):
+            try:
+                if self.root.winfo_exists():
+                    self._schedule_status_poll()
+            except tk.TclError:
+                pass
 
     def start_connection_monitor(self):
         """接続監視を開始"""
@@ -687,7 +923,7 @@ class LightWDconnectApp:
                 encoding='utf-8',
                 errors='replace',
                 timeout=30,
-                creationflags=subprocess.CREATE_NO_WINDOW
+                **_subprocess_hide_console_kwargs(),
             )
             
             if result.returncode == 0:
@@ -865,13 +1101,7 @@ class LightWDconnectApp:
             return
         
         if result.returncode == 0 and "connected" in result.stdout.lower():
-            self.wireless_status_label.config(text=f"ワイヤレス接続済み: {ip}:{port}", foreground="green")
-            self.refresh_devices()
-            print(f"ワイヤレス接続成功: {ip}:{port}")
-            # 接続履歴を保存
-            self.save_successful_connection(ip, port)
-            # 接続監視を開始
-            self.start_connection_monitor()
+            self._finalize_wireless_connected(ip, port)
         else:
             print(f"ワイヤレス接続失敗: {result.stdout if result else 'No response'}")
             # 診断情報を表示
@@ -893,6 +1123,104 @@ class LightWDconnectApp:
         else:
             print("ワイヤレスデバッグポートが見つかりませんでした。")
 
+    def easy_wireless_connect(self):
+        """簡単タブ: ボタン1回。保存/mDNS追従→USB補完→全候補。"""
+        self.clear_simple_log()
+        self.log_simple("接続を開始します...", "info")
+        
+        if not self.adb_path:
+            self.log_simple("ADBパスが設定されていません", "error")
+            messagebox.showwarning("ADB", "ADB パスを設定するか「検出」を押してください。")
+            return
+        
+        self.log_simple("USBデバイスからIPを取得中...", "info")
+        self._try_autofill_ip_from_usb()
+        
+        self.log_simple("保存された接続先を試行...", "info")
+        if self._try_saved_mdns_connect_with_refresh():
+            self.log_simple("接続成功！", "success")
+            return
+        
+        candidates = self._wireless_connect_candidates(include_mdns=True)
+        if not candidates:
+            self.log_simple("接続先が見つかりません", "error")
+            messagebox.showwarning(
+                "接続先がありません",
+                "初回は「詳細」タブでIP・ポートを入力してください。",
+            )
+            return
+        
+        pp = self.pairing_port_var.get().strip()
+        pc = self.pairing_code_var.get().strip()
+        pair_ip = candidates[0][0]
+        if pp or pc:
+            if not pp or not pc:
+                messagebox.showwarning(
+                    "ペアリング",
+                    "ペア用ポートとコードの両方を入力するか、どちらも空にしてください。",
+                )
+                return
+            self.log_simple(f"ペアリング: {pair_ip}:{pp}", "info")
+            pr = self.run_adb_command(["pair", f"{pair_ip}:{pp}", pc], timeout=30, retry_on_timeout=False)
+            if pr is None:
+                self.log_simple("ADBが応答しません", "error")
+                messagebox.showerror("ペアリング", "ADB が応答しません。")
+                return
+            out = (pr.stdout or "") + (pr.stderr or "")
+            if pr.returncode != 0:
+                self.log_simple(f"ペアリング失敗: {out.strip()}", "error")
+                messagebox.showerror("ペアリング失敗", (out.strip() or "不明なエラー")[:800])
+                return
+            self.log_simple("ペアリング完了", "success")
+            self.pairing_code_var.set("")
+            self.save_settings()
+        
+        last_err = ""
+        ok = False
+        used_ip, used_port = None, None
+        for ip, port in candidates:
+            self.log_simple(f"接続試行: {ip}:{port}", "info")
+            result = self.run_adb_command(["connect", f"{ip}:{port}"], timeout=20)
+            if result is None:
+                self.log_simple("ADBタイムアウト - サーバー再起動...", "error")
+                if self.reset_adb_server():
+                    self.log_simple("ADBサーバー再起動成功、再試行...", "info")
+                    result = self.run_adb_command(["connect", f"{ip}:{port}"], timeout=15)
+                else:
+                    last_err = "ADBサーバー再起動失敗"
+                    self.log_simple(last_err, "error")
+                    continue
+
+            msg = (result.stdout or "") + (result.stderr or "")
+            self.log_simple(f"応答: {msg.strip()[:200]}", "info")
+
+            if result.returncode == 0:
+                if "connected" in result.stdout.lower() or "already connected" in result.stdout.lower():
+                    self.log_simple("接続成功！", "success")
+                    ok = True
+                    used_ip, used_port = ip, port
+                    break
+                elif "failed" not in result.stdout.lower() and "error" not in result.stdout.lower():
+                    self.log_simple("接続成功（応答メッセージなし）", "success")
+                    ok = True
+                    used_ip, used_port = ip, port
+                    break
+
+            last_err = msg.strip() or "接続拒否"
+            self.log_simple(f"失敗: {last_err[:100]}", "error")
+        
+        if ok:
+            self._finalize_wireless_connected(used_ip, used_port)
+        else:
+            self.log_simple(f"接続失敗: {last_err[:100]}", "error")
+            messagebox.showerror(
+                "接続失敗",
+                (last_err or "接続に失敗しました。")[:800]
+                + "\n\nスマホのポートが変わっている場合は、新しい IP・ポートを下に入力してください。",
+            )
+            if used_ip is None and candidates:
+                self.diagnose_connection(candidates[0][0], candidates[0][1])
+
     def connect_wireless(self):
         """ワイヤレス接続を実行"""
         ip = self.ip_var.get().strip()
@@ -913,13 +1241,7 @@ class LightWDconnectApp:
             return
         
         if result.returncode == 0 and "connected" in result.stdout.lower():
-            self.wireless_status_label.config(text=f"ワイヤレス接続済み: {ip}:{port}", foreground="green")
-            self.refresh_devices()
-            print(f"ワイヤレス接続成功: {ip}:{port}")
-            # 接続履歴を保存
-            self.save_successful_connection(ip, port)
-            # 接続監視を開始
-            self.start_connection_monitor()
+            self._finalize_wireless_connected(ip, port)
         else:
             print(f"ワイヤレス接続失敗: {result.stdout}")
             self.diagnose_connection(ip, port)
@@ -1174,6 +1496,20 @@ class LightWDconnectApp:
                 # ポートを設定
                 if 'wireless_port' in config:
                     self.port_var.set(config['wireless_port'])
+                
+                if 'pairing_port' in config:
+                    self.pairing_port_var.set(str(config['pairing_port']))
+                
+                if 'connection_history' in config and isinstance(config['connection_history'], list):
+                    self.connection_history = []
+                    for item in config['connection_history']:
+                        if isinstance(item, dict) and 'ip' in item and 'port' in item:
+                            self.connection_history.append({
+                                'ip': item['ip'],
+                                'port': str(item['port']),
+                                'timestamp': item.get('timestamp', 0),
+                                'device_name': (item.get('device_name') or '').strip(),
+                            })
                     
                 # ウィンドウサイズを設定
                 if 'window_size' in config:
@@ -1197,6 +1533,588 @@ class LightWDconnectApp:
             self.logcat_window_size = "800x600"
         if not hasattr(self, 'logcat_theme'):
             self.logcat_theme = "light"
+        
+        self._refresh_simple_connect_hint()
+
+    def _parse_mdns_services_text(self, text):
+        """adb mdns services の出力から IPv4:port を抽出"""
+        if not text:
+            return []
+        found = []
+        seen = set()
+
+        def add_from_line(line):
+            for m in re.finditer(r'\b(\d{1,3}(?:\.\d{1,3}){3}):(\d{2,5})\b', line):
+                ip, port = m.group(1), m.group(2)
+                if not self.is_valid_ip(ip) or not port.isdigit():
+                    continue
+                p = int(port)
+                if p < 1 or p > 65535:
+                    continue
+                key = f"{ip}:{port}"
+                if key not in seen:
+                    seen.add(key)
+                    found.append((ip, port))
+
+        lines = text.splitlines()
+        interesting = [ln for ln in lines if re.search(r'(?i)adb|tls|_tcp|pair|service', ln)]
+        for ln in (interesting if interesting else lines):
+            add_from_line(ln)
+        if not found:
+            add_from_line(text)
+        return found
+
+    def _discover_via_adb_mdns(self):
+        """platform-tools の mDNS で同一LANのワイヤレスADBを列挙（ペア済み端末向け）"""
+        if not self.adb_path:
+            return []
+        chk = self.run_adb_command(["mdns", "check"], timeout=5, retry_on_timeout=False)
+        if chk is None:
+            return []
+        if chk.returncode != 0:
+            hint = (chk.stdout or chk.stderr or "").strip()
+            if hint:
+                print(f"mDNS check 非0（Windows は Bonjour や環境変数 ADB_MDNS_OPENSCREEN=1 が必要な場合あり）: {hint[:180]}")
+        r = self.run_adb_command(["mdns", "services"], timeout=14, retry_on_timeout=False)
+        if r is None or r.returncode != 0:
+            return []
+        blob = (r.stdout or "") + "\n" + (r.stderr or "")
+        eps = self._parse_mdns_services_text(blob)
+        if eps:
+            print(f"mDNS で {len(eps)} 件の候補を検出: {', '.join(f'{a}:{b}' for a, b in eps[:5])}{'…' if len(eps) > 5 else ''}")
+        return eps
+
+    def _adb_mdns_services_raw(self) -> str:
+        """adb mdns services の生テキスト（種別パース用）"""
+        if not self.adb_path:
+            return ""
+        chk = self.run_adb_command(["mdns", "check"], timeout=5, retry_on_timeout=False)
+        if chk is None:
+            return ""
+        if chk.returncode != 0:
+            hint = (chk.stdout or chk.stderr or "").strip()
+            if hint:
+                print(f"mDNS check 非0: {hint[:160]}")
+        r = self.run_adb_command(["mdns", "services"], timeout=14, retry_on_timeout=False)
+        if r is None or r.returncode != 0:
+            return ""
+        return (r.stdout or "") + "\n" + (r.stderr or "")
+
+    def _parse_mdns_pairing_and_connect(self, text: str):
+        """_adb-tls-pairing._tcp / _adb-tls-connect._tcp に紐づく行から IPv4:port を分類"""
+        pairing, connect = [], []
+        seen_p, seen_c = set(), set()
+        if not text:
+            return pairing, connect
+        for line in text.splitlines():
+            ll = line.lower()
+            found = re.findall(r"\b(\d{1,3}(?:\.\d{1,3}){3}):(\d{2,5})\b", line)
+            if not found:
+                continue
+            is_pair = "tls-pairing" in ll or "tls_pairing" in ll or "adbtlspa" in ll
+            is_conn = "tls-connect" in ll or "tls_connect" in ll or "adbtlsconn" in ll
+            if is_pair and not is_conn:
+                for ip, port in found:
+                    if not self.is_valid_ip(ip) or not port.isdigit():
+                        continue
+                    p = int(port)
+                    if p < 1 or p > 65535:
+                        continue
+                    key = (ip, port)
+                    if key not in seen_p:
+                        seen_p.add(key)
+                        pairing.append((ip, port))
+            elif is_conn:
+                for ip, port in found:
+                    if not self.is_valid_ip(ip) or not port.isdigit():
+                        continue
+                    p = int(port)
+                    if p < 1 or p > 65535:
+                        continue
+                    key = (ip, port)
+                    if key not in seen_c:
+                        seen_c.add(key)
+                        connect.append((ip, port))
+        return pairing, connect
+
+    def _parse_endpoint_line(self, line: str):
+        """'192.168.0.5:37045' 形式"""
+        if not line:
+            return None, None
+        line = line.strip().split()[0] if line.strip() else ""
+        if ":" not in line:
+            return None, None
+        ip, _, port = line.rpartition(":")
+        ip, port = ip.strip(), port.strip()
+        if not self.is_valid_ip(ip) or not port.isdigit():
+            return None, None
+        return ip, port
+
+    def _load_adb_device_txt(self):
+        try:
+            if not os.path.isfile(ADB_DEVICE_TXT):
+                return None, None
+            with open(ADB_DEVICE_TXT, "r", encoding="utf-8") as f:
+                raw = f.read().strip()
+            return self._parse_endpoint_line(raw)
+        except Exception as e:
+            print(f"{ADB_DEVICE_TXT} 読込: {e}")
+            return None, None
+
+    def _save_adb_device_txt(self, ip, port):
+        ps = str(port)
+        line = f"{ip}:{ps}\n"
+        try:
+            with open(ADB_DEVICE_TXT, "w", encoding="utf-8") as f:
+                f.write(line)
+            self.saved_mdns_endpoint_var.set(f"{ip}:{ps}")
+            self.ip_var.set(ip)
+            self.port_var.set(ps)
+            print(f"{ADB_DEVICE_TXT} に保存: {ip}:{ps}")
+        except Exception as e:
+            print(f"{ADB_DEVICE_TXT} 保存エラー: {e}")
+
+    def _sync_saved_endpoint_from_file(self):
+        ip, port = self._load_adb_device_txt()
+        if ip and port:
+            self.saved_mdns_endpoint_var.set(f"{ip}:{port}")
+
+    def _pick_connect_endpoint(self, pairing_ip, connect_list):
+        if not connect_list:
+            return None
+        for cip, cport in connect_list:
+            if cip == pairing_ip:
+                return (cip, cport)
+        return connect_list[0]
+
+    def _wait_mdns_connect_after_pair(self, pairing_ip, total_wait=12.0):
+        """ペア成功後: mDNS（_adb-tls-connect）をポーリングしつつ、同じ IP に対して nmap を並列実行"""
+        mdns_ep = [None]
+        nmap_ep = [None]
+
+        def mdns_poll():
+            deadline = time.time() + total_wait
+            while time.time() < deadline:
+                blob = self._adb_mdns_services_raw()
+                _, conn = self._parse_mdns_pairing_and_connect(blob)
+                if conn:
+                    picked = self._pick_connect_endpoint(pairing_ip, conn)
+                    if picked:
+                        mdns_ep[0] = picked
+                        print(f"mDNS 接続用: {picked[0]}:{picked[1]}")
+                        return
+                time.sleep(0.45)
+
+        def nmap_scan():
+            try:
+                p = self.scan_wireless_port_fast(pairing_ip)
+                if not p:
+                    p = self.scan_wireless_port(pairing_ip)
+                if p:
+                    nmap_ep[0] = (pairing_ip, str(p))
+                    print(f"nmap 候補: {pairing_ip}:{p}")
+            except Exception as e:
+                print(f"nmap スキャン: {e}")
+
+        t1 = threading.Thread(target=mdns_poll, daemon=True)
+        t2 = threading.Thread(target=nmap_scan, daemon=True)
+        t1.start()
+        t2.start()
+        t1.join(timeout=total_wait + 1)
+        t2.join(timeout=45)
+        if mdns_ep[0]:
+            return mdns_ep[0]
+        if nmap_ep[0]:
+            return nmap_ep[0]
+        return None
+
+    def mdns_pair_with_code_dialog(self):
+        """_adb-tls-pairing を mDNS から取得 → コードだけ入力 → pair → connect を adb_device.txt に"""
+        if not self.adb_path:
+            messagebox.showwarning("ADB", "ADB パスを設定するか「検出」を押してください。")
+            return
+        blob = self._adb_mdns_services_raw()
+        pairing, _ = self._parse_mdns_pairing_and_connect(blob)
+        if not pairing:
+            messagebox.showerror(
+                "mDNS",
+                "ペアリング用サービス（_adb-tls-pairing）が見つかりません。\n"
+                "・スマホでワイヤレスデバッグ ON\n・PC と同じ Wi‑Fi\n"
+                "・Windows では Bonjour や ADB_MDNS_OPENSCREEN=1 が必要なことがあります。",
+            )
+            return
+        ip, pport = pairing[0]
+        if len(pairing) > 1:
+            print(f"ペア候補が複数あります。先頭を使用: {ip}:{pport} （他: {pairing[1:]}）")
+        code = simpledialog.askstring(
+            "ペアリング",
+            "スマホのペアリングコードを入力してください",
+            parent=self.root,
+        )
+        if not code:
+            return
+        code = re.sub(r"\s+", "", code.strip())
+        if not code:
+            return
+        print(f"adb pair {ip}:{pport} …")
+        pr = self.run_adb_command(["pair", f"{ip}:{pport}", code], timeout=35, retry_on_timeout=False)
+        if pr is None:
+            messagebox.showerror("ペアリング", "ADB が応答しません。")
+            return
+        out = (pr.stdout or "") + (pr.stderr or "")
+        if pr.returncode != 0:
+            messagebox.showerror("ペアリング失敗", (out.strip() or "不明")[:700])
+            return
+        print(f"ペアリング成功: {out.strip()[:200]}")
+        ep = self._wait_mdns_connect_after_pair(ip)
+        if not ep:
+            blob2 = self._adb_mdns_services_raw()
+            _, conn2 = self._parse_mdns_pairing_and_connect(blob2)
+            if conn2:
+                cip, cport = self._pick_connect_endpoint(ip, conn2)
+                self._save_adb_device_txt(cip, cport)
+                messagebox.showinfo("保存", f"接続用を保存しました: {cip}:{cport}")
+            else:
+                messagebox.showwarning(
+                    "接続先",
+                    "接続用（_adb-tls-connect）が mDNS にまだ出ていません。\n"
+                    "数秒待って「接続（保存→失敗時mDNS更新）」を押すか、スマホ画面の接続用を手入力してください。",
+                )
+            return
+        cip, cport = ep
+        self._save_adb_device_txt(cip, cport)
+        messagebox.showinfo("完了", f"接続用を {ADB_DEVICE_TXT} と上の欄に保存しました。\n{cip}:{cport}")
+
+    def save_endpoint_from_box_to_file(self):
+        ip, port = self._parse_endpoint_line(self.saved_mdns_endpoint_var.get())
+        if not ip or not port:
+            messagebox.showwarning("入力", "例: 192.168.0.5:37045 の形式で入力してください。")
+            return
+        self._save_adb_device_txt(ip, port)
+        messagebox.showinfo("保存", f"{ADB_DEVICE_TXT} に書き込みました。")
+
+    def _get_connect_target_from_box_or_file(self):
+        ip, port = self._parse_endpoint_line(self.saved_mdns_endpoint_var.get().strip())
+        if ip and port:
+            return ip, port
+        return self._load_adb_device_txt()
+
+    def _try_adb_connect_ok(self, ip, port):
+        result = self.run_adb_command(["connect", f"{ip}:{port}"], timeout=15)
+        if result is None:
+            return False
+        return result.returncode == 0 and "connected" in (result.stdout or "").lower()
+
+    def _finalize_wireless_connected(self, ip, port):
+        self.ip_var.set(ip)
+        self.port_var.set(str(port))
+        self.refresh_devices()
+        dname = self._fetch_device_display_name_after_connect(f"{ip}:{port}")
+        self.save_successful_connection(ip, port, device_name=dname or None)
+        self._save_adb_device_txt(ip, port)
+        if dname:
+            self.wireless_status_label.config(
+                text=f"ワイヤレス: {dname} ({ip}:{port})",
+                foreground="green",
+            )
+        else:
+            self.wireless_status_label.config(
+                text=f"ワイヤレス接続済み: {ip}:{port}",
+                foreground="green",
+            )
+        print(f"ワイヤレス接続成功: {self._format_endpoint_label(ip, port)}")
+        self.start_connection_monitor()
+        self._refresh_simple_connect_hint()
+
+    def _try_saved_mdns_connect_with_refresh(self) -> bool:
+        """保存（ボックス/ファイル）→ connect。失敗したら _adb-tls-connect を mDNS で取り直して再試行"""
+        ip, port = self._get_connect_target_from_box_or_file()
+        if not ip or not port:
+            return False
+        print(f"保存済み接続先を試行: {ip}:{port}")
+        if self._try_adb_connect_ok(ip, port):
+            self._finalize_wireless_connected(ip, port)
+            return True
+        print("保存先では接続できませんでした。mDNS と nmap（保存済みIP）を並列で探索します…")
+        ip_saved, _ = self._get_connect_target_from_box_or_file()
+        endpoints = [None]
+
+        def mdns_job():
+            blob = self._adb_mdns_services_raw()
+            _, conn = self._parse_mdns_pairing_and_connect(blob)
+            endpoints[0] = conn or []
+
+        nmap_pair = [None]
+
+        def nmap_job():
+            if ip_saved and self.is_valid_ip(ip_saved):
+                p = self.scan_wireless_port_fast(ip_saved)
+                if not p:
+                    p = self.scan_wireless_port(ip_saved)
+                if p:
+                    nmap_pair[0] = (ip_saved, str(p))
+
+        t1 = threading.Thread(target=mdns_job, daemon=True)
+        t2 = threading.Thread(target=nmap_job, daemon=True)
+        t1.start()
+        t2.start()
+        t1.join(timeout=20)
+        t2.join(timeout=42)
+        eps = endpoints[0] or []
+        for ci, cp in eps:
+            print(f"接続試行: {ci}:{cp} (mDNS)")
+            if self._try_adb_connect_ok(ci, cp):
+                self._finalize_wireless_connected(ci, cp)
+                return True
+        if nmap_pair[0]:
+            ci, cp = nmap_pair[0]
+            print(f"接続試行: {ci}:{cp} (nmap)")
+            if self._try_adb_connect_ok(ci, cp):
+                self._finalize_wireless_connected(ci, cp)
+                return True
+        if not eps and not nmap_pair[0]:
+            print("mDNS にも nmap にも接続用候補がありませんでした。")
+        return False
+
+    def mdns_connect_saved_with_refresh(self):
+        if not self.adb_path:
+            messagebox.showwarning("ADB", "ADB パスを設定するか「検出」を押してください。")
+            return
+        if self._try_saved_mdns_connect_with_refresh():
+            return
+        messagebox.showerror(
+            "接続",
+            "保存された接続先でも、mDNS の接続用でも接続できませんでした。\n"
+            "ワイヤレスデバッグを一度 OFF→ON してから「ペアリング」をやり直してください。",
+        )
+
+    def _local_ipv4_subnet_prefixes(self):
+        """PC が属する IPv4 /24 の先頭3オクテット（同一LANスキャン用）"""
+        prefixes = []
+        seen = set()
+
+        def add_from_ip(ip):
+            if not ip or not self.is_valid_ip(ip):
+                return
+            if ip.startswith("127."):
+                return
+            if ip.startswith("169.254."):
+                return
+            pre = ".".join(ip.split(".")[:3])
+            if pre not in seen:
+                seen.add(pre)
+                prefixes.append(pre)
+
+        if sys.platform == "win32":
+            try:
+                r = subprocess.run(
+                    ["ipconfig"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    encoding="utf-8",
+                    errors="replace",
+                    **_subprocess_hide_console_kwargs(),
+                )
+                if r.stdout:
+                    for m in re.finditer(
+                        r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b",
+                        r.stdout,
+                    ):
+                        add_from_ip(m.group(1))
+            except Exception as e:
+                print(f"ipconfig 取得: {e}")
+
+        try:
+            s = py_socket.socket(py_socket.AF_INET, py_socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            add_from_ip(s.getsockname()[0])
+            s.close()
+        except Exception:
+            pass
+
+        return prefixes
+
+    def _scan_lan_open_ports(self, ports=("5555", "5556"), timeout=0.16, max_workers=96):
+        """同一LANの /24 を並列にスキャンし、ADB でよく使う TCP ポートが開いているホストを列挙"""
+        prefixes = self._local_ipv4_subnet_prefixes()
+        if not prefixes:
+            print("同一LANスキャン: ローカルサブネットを特定できませんでした")
+            return []
+
+        def check(ip_port):
+            ip, port_s = ip_port
+            try:
+                sock = py_socket.socket(py_socket.AF_INET, py_socket.SOCK_STREAM)
+                sock.settimeout(timeout)
+                r = sock.connect_ex((ip, int(port_s)))
+                sock.close()
+                return (ip, port_s) if r == 0 else None
+            except OSError:
+                return None
+
+        tasks = []
+        for pre in prefixes:
+            for host in range(1, 255):
+                ip = f"{pre}.{host}"
+                for p in ports:
+                    tasks.append((ip, str(p)))
+
+        out = []
+        seen = set()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            for res in pool.map(check, tasks, chunksize=32):
+                if res:
+                    k = f"{res[0]}:{res[1]}"
+                    if k not in seen:
+                        seen.add(k)
+                        out.append(res)
+        if out:
+            preview = ", ".join(f"{a}:{b}" for a, b in out[:10])
+            more = "…" if len(out) > 10 else ""
+            print(f"同一LANスキャン: {len(out)} 件 {preview}{more}")
+        else:
+            print(
+                "同一LANスキャン: 5555/5556 に応答なし。"
+                "（Android 11+ のワイヤレスTLSのランダムポートは mDNS かスマホ表示が必要）"
+            )
+        return out
+
+    def _try_autofill_ip_from_usb(self):
+        """USB でつながっているとき Wi‑Fi の IP を adb shell から入れる（ポートは別途 mDNS 等）"""
+        ip_u = self.ip_var.get().strip()
+        if ip_u and self.is_valid_ip(ip_u):
+            return
+        self.refresh_devices(preserve_selection=True)
+        dev = self.selected_device
+        if dev and ':' not in dev:
+            self.get_device_ip()
+            got = self.ip_var.get().strip()
+            if got and self.is_valid_ip(got):
+                print(f"USB 経由で端末の Wi‑Fi IP を取得: {got}")
+
+    def _wireless_connect_candidates(self, include_mdns=False):
+        """ワンボタン接続用。入力 → mDNS → 同一LANスキャン → 履歴（LAN/mDNS は接続ボタン時のみ）"""
+        seen = set()
+        out = []
+        ip_u, port_u = self.ip_var.get().strip(), self.port_var.get().strip()
+
+        if ip_u and self.is_valid_ip(ip_u) and port_u:
+            key = f"{ip_u}:{port_u}"
+            seen.add(key)
+            out.append((ip_u, port_u))
+
+        mdns_eps = self._discover_via_adb_mdns() if include_mdns else []
+        lan_eps = self._scan_lan_open_ports() if include_mdns else []
+
+        for ip, port in mdns_eps:
+            key = f"{ip}:{port}"
+            if key not in seen:
+                seen.add(key)
+                out.append((ip, port))
+
+        for ip, port in lan_eps:
+            key = f"{ip}:{port}"
+            if key not in seen:
+                seen.add(key)
+                out.append((ip, port))
+
+        if ip_u and self.is_valid_ip(ip_u) and not port_u:
+            for port in ("5555", "5556"):
+                key = f"{ip_u}:{port}"
+                if key not in seen:
+                    seen.add(key)
+                    out.append((ip_u, port))
+            for ip, port in mdns_eps:
+                if ip == ip_u:
+                    key = f"{ip}:{port}"
+                    if key not in seen:
+                        seen.add(key)
+                        out.append((ip, port))
+
+        if port_u and not (ip_u and self.is_valid_ip(ip_u)):
+            for ip, port in mdns_eps:
+                key = f"{ip}:{port_u}"
+                if key not in seen:
+                    seen.add(key)
+                    out.append((ip, port_u))
+            for ip, _port in lan_eps:
+                key = f"{ip}:{port_u}"
+                if key not in seen:
+                    seen.add(key)
+                    out.append((ip, port_u))
+
+        for entry in reversed(self.connection_history):
+            ip, port = entry.get('ip', '').strip(), str(entry.get('port', '')).strip()
+            if not ip or not self.is_valid_ip(ip) or not port:
+                continue
+            key = f"{ip}:{port}"
+            if key not in seen:
+                seen.add(key)
+                out.append((ip, port))
+        return out
+
+    def _lookup_history_device_name(self, ip, port):
+        """接続履歴に保存した表示名（メーカー + モデル）"""
+        ps = str(port)
+        for c in reversed(self.connection_history):
+            if c.get('ip') == ip and str(c.get('port')) == ps:
+                return (c.get('device_name') or '').strip()
+        return ''
+
+    def _format_endpoint_label(self, ip, port):
+        """ログ用: IP:ポート (端末名)"""
+        name = self._lookup_history_device_name(ip, port)
+        if name:
+            return f"{ip}:{port} ({name})"
+        return f"{ip}:{port}"
+
+    def _fetch_device_display_name_after_connect(self, serial):
+        """接続済みの serial（例 192.168.0.5:5555）から端末のわかりやすい名前を取得"""
+        if not self.adb_path or not serial:
+            return ''
+        m = self.run_adb_command(
+            ['-s', serial, 'shell', 'getprop', 'ro.product.model'],
+            timeout=5,
+            retry_on_timeout=False,
+        )
+        man = self.run_adb_command(
+            ['-s', serial, 'shell', 'getprop', 'ro.product.manufacturer'],
+            timeout=5,
+            retry_on_timeout=False,
+        )
+        model = (m.stdout or '').strip() if m and m.returncode == 0 else ''
+        manu = (man.stdout or '').strip() if man and man.returncode == 0 else ''
+        parts = [p for p in (manu, model) if p]
+        return ' '.join(parts) if parts else ''
+
+    def _refresh_simple_connect_hint(self):
+        """簡単タブの説明文を更新（mDNS は実行しない）"""
+        if not hasattr(self, 'simple_connect_hint_var'):
+            return
+        cands = self._wireless_connect_candidates(include_mdns=False)
+        ip_u, port_u = self.ip_var.get().strip(), self.port_var.get().strip()
+        if ip_u and port_u:
+            self.simple_connect_hint_var.set(
+                f"入力中の接続先を優先します: {ip_u}:{port_u}（空にすると自動検出・保存済みへ）"
+            )
+        elif ip_u and self.is_valid_ip(ip_u) and not port_u:
+            self.simple_connect_hint_var.set(
+                f"IP は自動取得済み: {ip_u}。接続ボタンで mDNS・5555 などを試します。"
+            )
+        elif cands:
+            last = cands[0]
+            extra = f" ほか {len(cands) - 1} 件も試行" if len(cands) > 1 else ""
+            dn = self._lookup_history_device_name(last[0], last[1])
+            tag = f"「{dn}」 " if dn else ""
+            self.simple_connect_hint_var.set(
+                f"保存済み: {tag}{last[0]}:{last[1]}。接続ボタン1回{extra}（mDNS・LAN も検索）"
+            )
+        else:
+            self.simple_connect_hint_var.set(
+                "同じ LAN でデバッグON → ボタン1回（mDNS ＋ 同一LANの 5555/5556 スキャン）。"
+                " TLS のランダムポートは mDNS かスマホ表示。USB 時は IP 自動取得。"
+            )
 
     def save_settings(self):
         """設定を保存"""
@@ -1218,6 +2136,9 @@ class LightWDconnectApp:
             # ポートを保存
             if self.port_var.get().strip():
                 config['wireless_port'] = self.port_var.get().strip()
+            
+            if self.pairing_port_var.get().strip():
+                config['pairing_port'] = self.pairing_port_var.get().strip()
                 
             # ウィンドウサイズを保存
             config['window_size'] = self.root.geometry()
@@ -1250,18 +2171,20 @@ class LightWDconnectApp:
         except Exception as e:
             print(f"設定保存エラー: {e}")
 
-    def save_successful_connection(self, ip, port):
-        """成功した接続を履歴に保存"""
+    def save_successful_connection(self, ip, port, device_name=None):
+        """成功した接続を履歴に保存（device_name は getprop 由来の表示用）"""
+        ps = str(port)
         connection_info = {
             'ip': ip,
-            'port': port,
-            'timestamp': time.time()
+            'port': ps,
+            'timestamp': time.time(),
+            'device_name': (device_name or '').strip(),
         }
         
         # 既存の同じ接続情報を削除
         self.connection_history = [
-            c for c in self.connection_history 
-            if not (c['ip'] == ip and c['port'] == port)
+            c for c in self.connection_history
+            if not (c['ip'] == ip and str(c['port']) == ps)
         ]
         
         # 新しい接続を追加
@@ -1273,6 +2196,7 @@ class LightWDconnectApp:
         
         print(f"接続履歴を保存: {ip}:{port}")
         self.save_settings()
+        self._refresh_simple_connect_hint()
 
     def get_last_successful_connection(self):
         """最後に成功した接続情報を取得"""
