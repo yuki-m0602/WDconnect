@@ -10,3 +10,4 @@ ENV/
 
 # ユーザー環境で生成
 wireless_debug_config.json
+adb_device.txt
